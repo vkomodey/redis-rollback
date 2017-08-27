@@ -3,6 +3,7 @@
 let bluebird = require('bluebird');
 let redis = require('redis');
 let fs = require('fs');
+let _ = require('lodash');
 
 bluebird.promisifyAll(redis.RedisClient.prototype);
 bluebird.promisifyAll(redis.Multi.prototype);
@@ -23,75 +24,70 @@ let handler = {
 function redisTxnInstruction(cmd, args) {
     return {
         cmd,
-        args,
+        args: _.isArray(args) ? args : [args],
     };
 }
 
-function execMulti(client, instructions, cb) {
+function execMulti(client, instructions) {
     let multi = client.multi();
     for (let instr of instructions) {
-        multi[instr.cmd].apply(multi, ...instr.args);
+        multi[instr.cmd].apply(multi, instr.args);
     }
 
-    multi.exec(cb);
+    return new Promise((resolve, reject) => {
+        multi.exec((err, replies) => err ? reject(err) : resolve(replies));
+    });
 }
 
-function isTransactionFailed(replies) {
-    return replies.filter(r => r instanceof redis.ReplyError).length > 0;
-}
-
-function tryRollback(client, replies, rollbackInstructions) {
+function tryRollback(client, mainReplies, rollbackCommands) {
     let errIndexes = [];
-    replies.forEach((reply, index) {
-        if ( reply instanceof Redis.ReplyError ) {
+    mainReplies.forEach((reply, index) => {
+        if ( reply instanceof redis.ReplyError ) {
             errIndexes.push(index);
         };
     });
 
     if (errIndexes.length > 0) {
-        let instructions = rollbackInstructions.filter((reply, index) => errIndexes.includes(index));
+        // Need to rollback only operations, which were performed successfully
+        let commandsToRollback = rollbackCommands.filter((reply, index) => !errIndexes.includes(index));
 
-        return execMulti(client, instructions);
+        return execMulti(client, commandsToRollback)
+            .then(res => Promise.reject('Operation has been rolled back'));
     }
 
-    return Promise.resolve();
+    return mainReplies;
 }
 
-function execAtomic(client, txnCmds) {
-    let  { mainInstructions, rollbackInstructions } = txnCmds;
-    let multi = client.multi();
-    return new Promise((resolve, reject) {
-        execMulti(client, mainInstructions, function(err, replies) {
-            
-        });
-    });
+function execAtomic(client, transactionCommands) {
+    return execMulti(client, transactionCommands.main)
+        .then(replies => tryRollback(client, replies, transactionCommands.rollback));
 }
 
 client.once('connect', function() {
-    let pClient = new Proxy(client, handler);
-    let p1 = pClient.set('a', 2);
-    let p2 = pClient.set('b', '2b');
-    let p3 = pClient.set('c', 2);
+    return Promise.all([client.set('a', 1), client.set('b', '123e'), client.set('c', 1),])
+        .then(() => {
+            let commands = {
+                main: [
+                    redisTxnInstruction('incr', 'a'),
+                    redisTxnInstruction('incr', 'b'),
+                    redisTxnInstruction('incr', 'c'),
+                ],
+                rollback: [
+                    redisTxnInstruction('decr', 'a'),
+                    redisTxnInstruction('decr', 'b'),
+                    redisTxnInstruction('decr', 'c'),
+                ],
+            }
+            
+            return execAtomic(client, commands)
+        })
+        .then(replies => {
+            console.log(replies);
+            return client.quit();
+        })
+        .catch((err) => {
+            console.log({err});
 
-    let txnCmds = {
-        main: [
-            redisTxnInstruction('incr', 'a'),
-            redisTxnInstruction('incr', 'b'),
-            redisTxnInstruction('incr', 'c'),
-        ],
-        rollback: [
-            redisTxnInstruction('decr', 'a'),
-            redisTxnInstruction('decr', 'b'),
-            redisTxnInstruction('decr', 'c'),
-        ],
-    }
-
-    let multi = client.multi();
-    multi.incr('a');
-    multi.incr('b');
-    multi.incr('c');
-
-    multi.exec(function(err, replies) {
-        client.quit();
-    });
+            return client.quit();
+        })
 });
