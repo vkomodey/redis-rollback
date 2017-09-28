@@ -10,10 +10,11 @@ bluebird.promisifyAll(redis.Multi.prototype);
 
 let client = redis.createClient();
 
+let syncProps = ['multi', 'quit'];
 let handler = {
     get(target, propKey, receiver) {
         return function(...args) {
-            if (propKey.indexOf('Async') !== -1) {
+            if (propKey.indexOf('Async') !== -1 || syncProps.includes(propKeys)) {
                 return target[propKey].apply(target, args);
             }
             return target[`${propKey}Async`].apply(target, args);
@@ -64,7 +65,8 @@ function execAtomic(client, transactionCommands) {
 }
 
 client.once('connect', function() {
-    return Promise.all([client.set('a', 1), client.set('b', '123e'), client.set('c', 1),])
+    let pClient = new Proxy(handler, client);
+    return Promise.all([pClient.set('a', 1), pClient.set('b', '123e'), pClient.set('c', 1),])
         .then(() => {
             let commands = {
                 main: [
@@ -79,11 +81,11 @@ client.once('connect', function() {
                 ],
             }
             
-            return execAtomic(client, commands)
+            return execAtomic(pClient, commands)
         })
         .then(replies => {
             console.log(replies);
-            return client.quit();
+            return pClient.quit();
         })
         .catch((err) => {
             console.log({err});
